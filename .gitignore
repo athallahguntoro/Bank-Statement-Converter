@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# PyInstaller build files
+build/
+dist/
+*.spec
+
+# App specific
+error_log.txt
+.bank_converter_config.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
