@@ -14,7 +14,8 @@ Run:
     python bca_converter.py
 
 Compile to .exe:
-    pyinstaller --onefile --windowed bca_converter.py
+    pyinstaller --onefile --windowed --name "BankStatementConverter_v1.4.0" bank-statement-converter.py
+
 """
 
 import re
@@ -42,7 +43,7 @@ def _resource_path(relative):
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 # ── Embedded logo (base64 PNG) ──────────────────────────────────────────────
 LOGO_B64 = (
@@ -871,6 +872,284 @@ def parse_pdf(pdf_path, pdf_password=""):
 
 
 # ════════════════════════════════════════════════════════════════════
+#  BANK JAGO — PDF PARSING
+# ════════════════════════════════════════════════════════════════════
+
+JAGO_MONTH_MAP = {
+    'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
+    'Mei': '05', 'Jun': '06', 'Jul': '07', 'Agu': '08',
+    'Sep': '09', 'Okt': '10', 'Nov': '11', 'Des': '12',
+}
+
+# Lines to skip inside Jago transaction pages
+JAGO_SKIP_RE = re.compile(
+    r'^PT Bank Jago'
+    r'|^www\.jago\.com'
+    r'|^Laporan Keuangan Bulanan'
+    r'|^Akun Aktif'
+    r'|^Total Pemasukan'
+    r'|^Total Pengeluaran'
+    r'|^Saldo Akhir'
+    r'|^INFO PENTING'
+    r'|^\*\s*Dokumen ini'
+    r'|^NILAI TUKAR MATA UANG'
+    r'|^Nilai tukar terhadap'
+    r'|^Mata Uang\s+Nilai Kurs'
+    r'|^\d+\s+[A-Z]{3}\s+[\d\.]+$'   # currency rate rows
+    r'|^RINGKASAN SALDO'
+    r'|^SOROTAN'
+    r'|^KANTONG PERSONAL'
+    r'|^KANTONG BERSAMA'
+    r'|^Nama Kantong'
+    r'|^Total Saldo'
+    r'|^merupakan peserta',
+    re.IGNORECASE | re.MULTILINE
+)
+
+
+def _parse_jago_amount(s):
+    """Convert Jago Indonesian-format number string to float.
+    e.g. '10.067.671' -> 10067671.0  |  '59.900,90' -> 59900.9
+    """
+    if not s:
+        return None
+    s = s.strip().lstrip('+').lstrip('-')
+    # Replace dots (thousands separators) then comma (decimal separator)
+    s = s.replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_jago_date(s):
+    """Convert 'DD Mon YYYY' to 'DD/MM/YYYY'. Returns None if unparseable."""
+    parts = s.strip().split()
+    if len(parts) != 3:
+        return None
+    day, mon, year = parts
+    mm = JAGO_MONTH_MAP.get(mon)
+    if not mm:
+        return None
+    try:
+        return f"{int(day):02d}/{mm}/{year}"
+    except ValueError:
+        return None
+
+
+# Matches the start of a transaction line:
+# e.g. "24 Apr 2026  BAKMI ONO  Pembayaran QRIS  -50.000  10.067.671"
+JAGO_TXN_RE = re.compile(
+    r'^(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})'
+    r'\s+(.+?)'
+    r'\s+([+-][\d\.]+(?:,[\d]+)?)'
+    r'\s+([\d\.]+(?:,[\d]+)?)\s*$'
+)
+
+# Also handle transactions where balance is bare 0
+JAGO_TXN_ZERO_BAL_RE = re.compile(
+    r'^(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})'
+    r'\s+(.+?)'
+    r'\s+([+-]\d[\d\.]*(?:,[\d]+)?)'
+    r'\s+(0)\s*$'
+)
+
+# Matches the time line that immediately follows a transaction line
+JAGO_TIME_RE = re.compile(r'^(\d{2}\.\d{2})\s*(.*)')
+
+# Matches a pocket header: a line that is just a pocket name followed by "Saldo Sebelumnya"
+# The name occupies the full line before the summary block
+JAGO_POCKET_HEADER_RE = re.compile(
+    r'^(.+?)\s+Saldo Sebelumnya'
+)
+
+# Matches an ID Kantong line to capture pocket ID
+JAGO_ID_KANTONG_RE = re.compile(r'ID Kantong\s+(\S+)')
+
+# Matches currency line
+JAGO_CURRENCY_RE = re.compile(r'Mata Uang Dalam\s+(\w+)')
+
+
+def _parse_jago_page(text, account_name):
+    """
+    Parse a single page of a Jago PDF (from page 3 onward).
+    Returns a list of transaction dicts.
+    One page may contain multiple Kantong sections.
+    """
+    transactions = []
+    lines = text.splitlines()
+
+    current_pocket = None
+    current_id = None
+    current_currency = 'IDR'
+    current_txn = None
+    in_txn_section = False
+
+    def flush_txn():
+        nonlocal current_txn
+        if current_txn:
+            transactions.append(dict(current_txn))
+        current_txn = None
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.strip()
+        i += 1
+
+        if not line:
+            continue
+
+        # Skip boilerplate lines
+        if JAGO_SKIP_RE.search(line):
+            continue
+
+        # Detect start of a new Kantong section from header line
+        # e.g. "Kantong Utama   Saldo Sebelumnya 0,39"
+        ph = JAGO_POCKET_HEADER_RE.match(line)
+        if ph:
+            flush_txn()
+            current_pocket = ph.group(1).strip()
+            in_txn_section = False
+            # Check if ID Kantong is embedded in this same line
+            id_inline = JAGO_ID_KANTONG_RE.search(line)
+            if id_inline:
+                current_id = id_inline.group(1)
+            continue
+
+        # Capture ID Kantong (standalone line)
+        id_m = JAGO_ID_KANTONG_RE.search(line)
+        if id_m:
+            current_id = id_m.group(1)
+            continue
+
+        # Capture currency
+        cur_m = JAGO_CURRENCY_RE.search(line)
+        if cur_m:
+            current_currency = cur_m.group(1).upper()
+            in_txn_section = False
+            continue
+
+        # Column header line — next lines are transactions
+        if re.match(r'^Tanggal\s*&\s*Waktu', line, re.IGNORECASE):
+            in_txn_section = True
+            continue
+
+        if not in_txn_section or current_pocket is None:
+            continue
+
+        # Skip ID# lines and raw transaction codes
+        if re.match(r'^ID#\s+', line):
+            continue
+        if re.match(r'^[A-Z0-9]{10,}', line) and ' ' not in line:
+            continue
+
+        # Try to match a transaction line (handles both decimal and integer amounts)
+        txn_m = JAGO_TXN_RE.match(line) or JAGO_TXN_ZERO_BAL_RE.match(line)
+        if txn_m:
+            flush_txn()
+            date_raw   = txn_m.group(1)
+            desc_raw   = txn_m.group(2).strip()
+            amount_raw = txn_m.group(3)
+            bal_raw    = txn_m.group(4)
+
+            date_str = _parse_jago_date(date_raw)
+            if not date_str:
+                continue
+
+            amount = _parse_jago_amount(amount_raw)
+            balance = _parse_jago_amount(bal_raw)
+            is_debit = amount_raw.startswith('-')
+
+            current_txn = {
+                'date':         date_str,
+                'account_no':   current_id or '',
+                'bank_name':    'Jago',
+                'account_name': account_name,
+                'currency':     current_currency,
+                'fasilitas':    current_pocket,
+                'notes':        '',
+                'keterangan':   desc_raw,
+                'debit':        amount if is_debit else None,
+                'credit':       amount if not is_debit else None,
+                'balance':      balance,
+            }
+            continue
+
+        # Time line (HH.MM + extra info) — second line of a transaction
+        time_m = JAGO_TIME_RE.match(line)
+        if time_m and current_txn is not None:
+            extra = time_m.group(2).strip()
+            # extra may contain bank name + account, or just bank name
+            # Append to keterangan only if it's not a bare ID# or code
+            if extra and not re.match(r'^ID#\s+', extra) and not re.match(r'^[A-Z0-9]{10,}$', extra):
+                # Remove trailing ID# portion if present
+                extra = re.sub(r'\s*ID#\s+\S+.*$', '', extra).strip()
+                if extra:
+                    current_txn['keterangan'] = (current_txn['keterangan'] + ' ' + extra).strip()
+            continue
+
+        # Any other continuation line — append to keterangan if we have an active txn
+        if current_txn is not None:
+            # Skip pure ID# lines, transaction codes, and page markers
+            if (re.match(r'^ID#\s+', line)
+                    or re.match(r'^[A-Z0-9]{15,}$', line)
+                    or re.match(r'^\d+$', line)
+                    or re.match(r'^\d+\s*/\s*\d+$', line)):
+                continue
+            # Append meaningful continuation text
+            current_txn['keterangan'] = (current_txn['keterangan'] + ' ' + line).strip()
+
+    flush_txn()
+    return transactions
+
+
+def parse_jago_pdf(pdf_path, pdf_password=""):
+    """
+    Parse a Bank Jago monthly statement PDF.
+    - Skips page 1 (summary page) and any page without transaction data.
+    - Each Kantong is treated as a separate account (account_no = ID Kantong).
+    Returns a list of transaction dicts.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
+
+    all_transactions = []
+    open_kw = {'password': pdf_password.encode('latin-1')} if pdf_password else {}
+
+    with pdfplumber.open(pdf_path, **open_kw) as pdf:
+        # Extract account name from page 1
+        account_name = ''
+        if pdf.pages:
+            p1_text = pdf.pages[0].extract_text() or ''
+            m = re.search(r'^(.+?)\s*/\s*[\d]+', p1_text, re.MULTILINE)
+            if m:
+                account_name = m.group(1).strip().title()
+
+        # Skip page 1 (always summary); parse from page 2 onward
+        for page in pdf.pages[1:]:
+            text = page.extract_text() or ''
+            # Skip pages that have no transaction section
+            if not re.search(r'Tanggal\s*&\s*Waktu', text, re.IGNORECASE):
+                continue
+            txns = _parse_jago_page(text, account_name)
+            all_transactions.extend(txns)
+
+    # Post-process: clean up keterangan & infer type
+    result = []
+    for t in all_transactions:
+        t['keterangan'] = ' '.join(t.get('keterangan', '').split())
+        if not t.get('keterangan'):
+            continue
+        if t.get('debit') is None and t.get('credit') is None and t.get('balance') is None:
+            continue
+        result.append(t)
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════
 #  BANK ADAPTER PLUGIN SYSTEM
 # ════════════════════════════════════════════════════════════════════
 
@@ -892,6 +1171,15 @@ class BCAAdapter(BankAdapter):
 
     def parse(self, pdf_path, pdf_password=""):
         return parse_pdf(pdf_path, pdf_password=pdf_password)
+
+
+class JagoAdapter(BankAdapter):
+    name  = "Jago — Bank Jago"
+    code  = "Jago"
+    ready = True
+
+    def parse(self, pdf_path, pdf_password=""):
+        return parse_jago_pdf(pdf_path, pdf_password=pdf_password)
 
 
 class MandiriAdapter(BankAdapter):
@@ -932,7 +1220,7 @@ class BRIAdapter(BankAdapter):
 
 
 # Registry: ordered list of adapters
-BANK_ADAPTERS = [BCAAdapter(), MandiriAdapter(), BNIAdapter(), BRIAdapter()]
+BANK_ADAPTERS = [BCAAdapter(), JagoAdapter(), MandiriAdapter(), BNIAdapter(), BRIAdapter()]
 BANK_ADAPTER_MAP = {a.code: a for a in BANK_ADAPTERS}
 
 
@@ -1547,9 +1835,23 @@ DEFAULT_RULES = [
     {"keyword": "DEPOSITO",            "type": "DEPOSITO",             "bank": "BCA", "locked": False},
     {"keyword": "DB DEBIT DOMESTIK",   "type": "DEBIT",                "bank": "BCA", "locked": False},
     {"keyword": "BI-FAST",             "type": "BI-FAST",              "bank": "BCA", "locked": False},
-    {"keyword": "BUNGA POKET",         "type": "INTEREST",             "bank": "BCA", "locked": False},
-    {"keyword": "TRF BERKALA",         "type": "AUTO TRANSFER",        "bank": "BCA", "locked": False},
-    {"keyword": "SETORAN AWAL",        "type": "INITIAL DEPOSIT",      "bank": "BCA", "locked": False},
+    {"keyword": "BUNGA POKET",         "type": "INTEREST",             "bank": "BCA",  "locked": False},
+    {"keyword": "TRF BERKALA",         "type": "AUTO TRANSFER",        "bank": "BCA",  "locked": False},
+    {"keyword": "SETORAN AWAL",        "type": "INITIAL DEPOSIT",      "bank": "BCA",  "locked": False},
+    # ── Jago rules ────────────────────────────────────────────────────
+    {"keyword": "Bunga",               "type": "INTEREST",             "bank": "Jago", "locked": False},
+    {"keyword": "Pajak Bunga",         "type": "TAX",                  "bank": "Jago", "locked": False},
+    {"keyword": "Transfer Masuk",      "type": "TRANSFER IN",          "bank": "Jago", "locked": False},
+    {"keyword": "Transfer Keluar",     "type": "TRANSFER OUT",         "bank": "Jago", "locked": False},
+    {"keyword": "Pembayaran QRIS",     "type": "QRIS",                 "bank": "Jago", "locked": False},
+    {"keyword": "Transaksi POS",       "type": "CARD",                 "bank": "Jago", "locked": False},
+    {"keyword": "Pindah uang antar",   "type": "POCKET TRANSFER",      "bank": "Jago", "locked": False},
+    {"keyword": "Pencairan Dana dari", "type": "GOPAY",                "bank": "Jago", "locked": False},
+    {"keyword": "Transaksi GoPay",     "type": "GOPAY",                "bank": "Jago", "locked": False},
+    {"keyword": "Gopay Savings",       "type": "GOPAY",                "bank": "Jago", "locked": False},
+    {"keyword": "Jago Pay",            "type": "JAGO PAY",             "bank": "Jago", "locked": False},
+    {"keyword": "Pencairan Reksa Dana","type": "MUTUAL FUND",          "bank": "Jago", "locked": False},
+    {"keyword": "Tambah Uang Kantong", "type": "POCKET TRANSFER",      "bank": "Jago", "locked": False},
 ]
 
 FORMAT_MAP = [
