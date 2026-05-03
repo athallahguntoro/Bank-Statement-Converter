@@ -5,7 +5,7 @@ Converts BCA PDF bank statements to Excel, XML, JSON, CSV, TSV,
 Markdown, YAML, RTF, ODT, or Parquet.
 
 Requirements:
-    pip install pdfplumber openpyxl
+    pip install pdfplumber openpyxl python-dotenv
 
 Optional (for extra export formats):
     pip install pyyaml odfpy pandas pyarrow
@@ -24,6 +24,12 @@ import json
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGERATE_API_KEY")
 
 # Self-reference that works both as a script and inside a PyInstaller .exe
 # (where __name__ == '__main__' and 'bca_converter' is not in sys.modules)
@@ -966,13 +972,14 @@ def fetch_fx_rate(currency, date_str, api_key=""):
     import urllib.error
 
     if currency == 'IDR':
-        return 1.0
+        return 1.0, "IDR"
 
     cache_key = (currency.upper(), date_str)
     if cache_key in _fx_cache:
         return _fx_cache[cache_key]
 
     rate = None
+    source = None
 
     # ── 1. Historical endpoint (paid API key) ─────────────────────────
     if api_key:
@@ -980,17 +987,35 @@ def fetch_fx_rate(currency, date_str, api_key=""):
         if parsed:
             y, m, d = parsed
             url = (f"https://v6.exchangerate-api.com/v6/{api_key}"
-                   f"/history/{currency.upper()}/{y}/{m}/{d}")
+                   f"/history/{currency.upper()}/{y}/{m:02d}/{d:02d}")
             try:
                 with urllib.request.urlopen(url, timeout=8) as r:
                     data = json.loads(r.read())
                 if data.get('result') == 'success':
                     rates = data.get('conversion_rates', {})
                     rate  = rates.get('IDR')
+                    if rate:
+                        source = "historical"
             except Exception:
                 pass
 
-    # ── 2. Latest rates fallback (free, no key needed) ────────────────
+    # ── 2. Fawaz Ahmed Free Historical API ────────────────────────────
+    if rate is None:
+        parsed = _parse_date(date_str)
+        if parsed:
+            y, m, d = parsed
+            fawaz_date = f"{y}-{m:02d}-{d:02d}"
+            url = f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{fawaz_date}/v1/currencies/{currency.lower()}.json"
+            try:
+                with urllib.request.urlopen(url, timeout=8) as r:
+                    data = json.loads(r.read())
+                rate = data.get(currency.lower(), {}).get('idr')
+                if rate:
+                    source = "historical"
+            except Exception:
+                pass
+
+    # ── 3. Latest rates fallback (free, no key needed) ────────────────
     if rate is None:
         url = f"https://open.er-api.com/v6/latest/{currency.upper()}"
         try:
@@ -998,12 +1023,14 @@ def fetch_fx_rate(currency, date_str, api_key=""):
                 data = json.loads(r.read())
             if data.get('result') == 'success':
                 rate = data.get('rates', {}).get('IDR')
+                if rate:
+                    source = "latest fallback"
         except Exception:
             pass
 
     if rate is not None:
-        _fx_cache[cache_key] = rate
-    return rate
+        _fx_cache[cache_key] = (rate, source)
+    return (rate, source) if rate else (None, None)
 
 
 def apply_fx_rates(transactions, api_key="", log_fn=None):
@@ -1022,11 +1049,15 @@ def apply_fx_rates(transactions, api_key="", log_fn=None):
 
     fetched, failed = 0, 0
     for currency, date_str in sorted(needed):
-        rate = fetch_fx_rate(currency, date_str, api_key)
+        rate_info = fetch_fx_rate(currency, date_str, api_key)
+        if isinstance(rate_info, tuple):
+            rate, source = rate_info
+        else:
+            rate, source = rate_info, "unknown"
+            
         if rate:
             fetched += 1
             if log_fn:
-                source = "historical" if api_key else "latest"
                 log_fn(f"  FX {currency}/{date_str}: 1 {currency} = {rate:,.2f} IDR ({source})", "info")
         else:
             failed += 1
@@ -1042,10 +1073,17 @@ def apply_fx_rates(transactions, api_key="", log_fn=None):
             t['_local_amount']  = None
             t['_local_balance'] = None
         else:
-            rate = _fx_cache.get((currency.upper(), t.get('date', '')))
+            cached = _fx_cache.get((currency.upper(), t.get('date', '')))
+            if cached and isinstance(cached, tuple):
+                rate, source = cached
+            elif cached:
+                rate, source = cached, "unknown"
+            else:
+                rate, source = None, None
+                
             t['_fx_rate'] = rate
             if rate is not None:
-                t['_fx_rate_mode'] = 'Exact Date' if api_key else "Today's Rate"
+                t['_fx_rate_mode'] = 'Exact Date' if source == 'historical' else "Today's Rate"
                 debit  = t.get('debit')
                 credit = t.get('credit')
                 if debit is not None:
@@ -1668,7 +1706,7 @@ class App(_AppBase):
         self.fmt_var          = tk.StringVar(value="preview")
         self._dark            = cfg.get("dark_mode", False)
         self._offline         = cfg.get("offline_mode", False)
-        self._fx_api_key      = cfg.get("fx_api_key", "")
+        self._fx_api_key      = EXCHANGE_RATE_API_KEY or cfg.get("fx_api_key", "") or ""
         self._last_out_folder = cfg.get("last_output_folder", "")
         self._budgets         = cfg.get("budgets", {})   # {type_label: monthly_limit}
         self._parsed_txns     = []        # last parsed transactions for preview
